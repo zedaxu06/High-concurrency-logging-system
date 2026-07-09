@@ -80,7 +80,7 @@ void bench_compare(const std::vector<int>& thread_counts, int per_thread) {
             cfg.threads    = tc;
             cfg.per_thread = per_thread;
             cfg.queue      = kind;
-            cfg.dir        = "bench_logs";
+            cfg.dir        = "runtime/bench_logs";
             print_row(bench_run(cfg));
         }
         std::printf("---------------------------------------------------------------------------------\n");

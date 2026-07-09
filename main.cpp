@@ -22,7 +22,7 @@ static void init_console_utf8() {
 
 // 从应用日志读取一行密文并解密，验证 .log.enc 内容可还原
 static void demo_decrypt_preview() {
-    std::ifstream in("logs/application/application_001.log.enc");
+    std::ifstream in("runtime/logs/application/application_001.log.enc");
     if (!in) return;
     std::string line;
     if (std::getline(in, line)) {
@@ -46,7 +46,7 @@ int main(int argc, char** argv) {
 
     // 默认：基础功能演示（预案主流程）
     std::printf("==== 高并发异步日志系统 ====\n");
-    log_init("logs", LogLevel::DEBUG, QueueKind::Mutex);
+    log_init("runtime/logs", LogLevel::DEBUG, QueueKind::Mutex);
 
     std::printf("启动 5 个业务线程，每线程 1000 条日志...\n");
     run_business_test(5, 1000);

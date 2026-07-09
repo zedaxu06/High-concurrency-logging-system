@@ -1,8 +1,12 @@
 # build artifacts
 *.o
-logsys
+*.exe
+build/
+bin/
+output/
 
 # runtime log output
-logs/
-bench_logs/
-test_logs_*/
+runtime/
+
+# editor configuration
+.vscode/

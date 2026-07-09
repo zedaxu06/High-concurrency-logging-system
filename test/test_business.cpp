@@ -69,20 +69,20 @@ static bool file_nonempty(const std::string& path) {
 }
 
 bool test_basic_log() {
-    fs::remove_all("test_logs_basic");
-    log_init("test_logs_basic", LogLevel::DEBUG, QueueKind::Mutex);
+    fs::remove_all("runtime/test_logs_basic");
+    log_init("runtime/test_logs_basic", LogLevel::DEBUG, QueueKind::Mutex);
     log_app(LogLevel::INFO, "hello basic %d", 1);
     log_operation(LogLevel::INFO, "op basic %d", 2);
     log_error("err basic %d", 3);
     log_close();
-    return file_nonempty("test_logs_basic/application/application_001.log.enc") &&
-           file_nonempty("test_logs_basic/operation/operation_001.log.enc") &&
-           file_nonempty("test_logs_basic/error/error_001.log.enc");
+        return file_nonempty("runtime/test_logs_basic/application/application_001.log.enc") &&
+            file_nonempty("runtime/test_logs_basic/operation/operation_001.log.enc") &&
+            file_nonempty("runtime/test_logs_basic/error/error_001.log.enc");
 }
 
 bool test_level_filter() {
-    fs::remove_all("test_logs_filter");
-    log_init("test_logs_filter", LogLevel::WARN, QueueKind::Mutex);
+        fs::remove_all("runtime/test_logs_filter");
+        log_init("runtime/test_logs_filter", LogLevel::WARN, QueueKind::Mutex);
     uint64_t before = global_logger().metrics().enqueued();
     log_app(LogLevel::INFO,  "should be filtered");   // < WARN，被过滤
     log_app(LogLevel::DEBUG, "should be filtered");   // < WARN，被过滤
@@ -94,14 +94,14 @@ bool test_level_filter() {
 }
 
 bool test_file_rotate() {
-    fs::remove_all("test_logs_rotate");
-    log_init("test_logs_rotate", LogLevel::DEBUG, QueueKind::Mutex);
+    fs::remove_all("runtime/test_logs_rotate");
+    log_init("runtime/test_logs_rotate", LogLevel::DEBUG, QueueKind::Mutex);
     int total = (int)MAX_LINES_PER_FILE + 50;
     for (int i = 0; i < total; ++i)
         log_app(LogLevel::INFO, "rotate line %d", i);
     log_close();
     // 超过单文件行数上限后应切分出第二个文件
-    return fs::exists("test_logs_rotate/application/application_002.log.enc");
+    return fs::exists("runtime/test_logs_rotate/application/application_002.log.enc");
 }
 
 bool test_queue_full() {
@@ -119,11 +119,11 @@ bool test_queue_full() {
 }
 
 bool test_decrypt_one_line() {
-    fs::remove_all("test_logs_decrypt");
-    log_init("test_logs_decrypt", LogLevel::DEBUG, QueueKind::Mutex);
+    fs::remove_all("runtime/test_logs_decrypt");
+    log_init("runtime/test_logs_decrypt", LogLevel::DEBUG, QueueKind::Mutex);
     log_app(LogLevel::INFO, "decrypt marker ABC123");
     log_close();
-    std::ifstream in("test_logs_decrypt/application/application_001.log.enc");
+    std::ifstream in("runtime/test_logs_decrypt/application/application_001.log.enc");
     std::string hexline;
     std::getline(in, hexline);
     std::string plain = xor_decrypt_from_hex(hexline);

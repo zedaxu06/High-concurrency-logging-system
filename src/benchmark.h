@@ -10,7 +10,7 @@ struct BenchConfig {
     int         per_thread = 50000;
     int         warmup     = 1000;
     QueueKind   queue      = QueueKind::Mutex;
-    std::string dir        = "bench_logs";
+    std::string dir        = "runtime/bench_logs";
 };
 
 struct BenchResult {

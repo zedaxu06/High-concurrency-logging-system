@@ -2,31 +2,40 @@ CXX      ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -pthread -finput-charset=utf-8 -fexec-charset=utf-8
 LDFLAGS  ?= -pthread
 
-SRCS = log_crypto.cpp metrics.cpp log_writer.cpp logger.cpp \
-       test_business.cpp benchmark.cpp main.cpp
-OBJS = $(SRCS:.cpp=.o)
-DEPS = $(wildcard *.h)
-TARGET = logsys
+SRC_DIR   := src
+TEST_DIR  := test
+BUILD_DIR := build
+BIN_DIR   := bin
+RUNTIME_DIR := runtime
 
-all: $(TARGET)
+SRCS = $(SRC_DIR)/log_crypto.cpp $(SRC_DIR)/metrics.cpp $(SRC_DIR)/log_writer.cpp $(SRC_DIR)/logger.cpp \
+       $(TEST_DIR)/test_business.cpp benchmark.cpp main.cpp
+OBJS = $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(SRCS))
+DEPS = $(wildcard $(SRC_DIR)/*.h) $(wildcard $(TEST_DIR)/*.h)
+TARGET = $(BIN_DIR)/logsys
+
+all: dirs $(TARGET)
+
+dirs:
+	mkdir -p $(BUILD_DIR) $(BIN_DIR) $(RUNTIME_DIR)
 
 $(TARGET): $(OBJS)
 	$(CXX) $(OBJS) $(LDFLAGS) -o $@
 
-%.o: %.cpp $(DEPS)
-	$(CXX) $(CXXFLAGS) -c $< -o $@
+$(BUILD_DIR)/%.o: %.cpp $(DEPS) | dirs
+	mkdir -p $(dir $@)
+	$(CXX) $(CXXFLAGS) -I./$(SRC_DIR) -c $< -o $@
 
-run: $(TARGET)
+run: dirs $(TARGET)
 	./$(TARGET) run
 
-test: $(TARGET)
+test: dirs $(TARGET)
 	./$(TARGET) test
 
-bench: $(TARGET)
+bench: dirs $(TARGET)
 	./$(TARGET) bench
 
 clean:
-	rm -f $(OBJS) $(TARGET)
-	rm -rf logs bench_logs test_logs_*
+	rm -rf $(BUILD_DIR) $(BIN_DIR)
 
 .PHONY: all run test bench clean
