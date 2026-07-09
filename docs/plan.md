@@ -1,416 +1,131 @@
-这是本地 C 语言异步日志库，主流程是业务线程写日志请求，日志进入异步队列，后台线程批量出队、分类、加密、写入 `.log.enc` 文件，并支持关闭收尾和丢弃统计。
+﻿# 高并发日志系统架构说明（当前实现）
 
-# 一、公共类型模块：`log_common.h`
+更新时间：2026-07-09
 
-这个模块不实现函数，只放公共定义。
+本文档描述仓库当前可运行实现（C++17），用于替代早期的 C 版本预案说明。
 
-需要定义这些内容：
+## 1. 架构目标
 
-| 名称                   | 作用                                           |
-| -------------------- | -------------------------------------------- |
-| `LogLevel`           | 表示日志等级：`DEBUG / INFO / WARN / ERROR`         |
-| `LogCategory`        | 表示日志类别：`APP_LOG / OPERATION_LOG / ERROR_LOG` |
-| `LogRecord`          | 队列中真正保存的一条日志，包括日志等级、日志类别、格式化后的文本             |
-| `LOG_QUEUE_CAPACITY` | 队列容量，建议按文档使用 `8192`                          |
-| `BATCH_SIZE`         | 后台线程每次最多取多少条日志，建议 `32`                       |
-| `MAX_LINES_PER_FILE` | 单个文件最大行数，达到后切分                               |
-| `LOG_XOR_KEY`        | XOR 加密密钥                                     |
+- 支持高并发业务线程写日志，降低业务线程阻塞时间。
+- 使用异步落盘，避免业务线程直接执行慢速 I/O。
+- 对日志进行简单加密存储（XOR + HEX）。
+- 提供可对比的两种队列实现（加锁与无锁）。
+- 提供基础测试与压测，验证功能正确性与性能趋势。
 
-你们文档里已经明确 `LogRecord` 保存 `level`、`category` 和 `text[512]`，队列容量、批量大小、切分行数和 XOR 密钥也已经列出来了。
+## 2. 总体架构
 
----
+### 2.1 组件
 
-# 二、队列模块：`log_queue.h / log_queue.c`
+- `Logger`：系统核心，负责初始化、入队、后台消费线程生命周期。
+- `IQueue`：队列抽象接口。
+- `MutexRingQueue`：互斥锁循环队列实现。
+- `LockFreeRingQueue`：基于序号/CAS 的有界无锁队列实现。
+- `LogWriter`：日志分类落盘、文件切分、flush/close。
+- `log_crypto`：XOR 加密与十六进制编解码。
+- `Metrics`：吞吐和延迟指标采集与汇总。
 
-队列模块只负责维护循环队列本身，**不负责加锁**。加锁交给 `logger.c` 和 `log_writer.c`。
+### 2.2 线程模型
 
-需要实现这些函数：
+- 生产者：多个业务线程调用 `log_app`/`log_operation`/`log_error`。
+- 消费者：单后台线程 `Logger::thread_func`。
+- 使用模型：实际业务路径为 MPSC（多生产者单消费者）。
 
-| 函数名               | 功能                                      |
-| ----------------- | --------------------------------------- |
-| `queue_init`      | 初始化循环队列，把 `front`、`rear`、`count` 设为初始状态 |
-| `queue_empty`     | 判断队列是否为空                                |
-| `queue_full`      | 判断队列是否已满                                |
-| `queue_push`      | 向队尾写入一条 `LogRecord`                     |
-| `queue_pop_batch` | 从队头批量取出最多 `BATCH_SIZE` 条日志              |
+### 2.3 主流程
 
-这里要强调一点：你们文档已经写明，`queue_push` 和 `queue_pop_batch` 调用者必须在外部加锁。
+1. 业务线程调用日志接口。
+2. `Logger::vwrite` 完成等级过滤和字符串格式化。
+3. 调用 `queue_->try_push` 入队。
+4. 入队成功后唤醒后台线程；失败则累加 dropped。
+5. 后台线程批量 `pop_batch`。
+6. `LogWriter::write` 对文本加密并写入分类文件。
+7. 达到 `MAX_LINES_PER_FILE` 后轮转到下一个文件。
 
-所以队列模块只管数据结构，不管线程同步。
+## 3. 模块映射（当前代码）
 
----
+| 文件 | 主要职责 |
+| --- | --- |
+| `src/log_common.h` | 日志等级/类别、容量和阈值常量、`LogRecord` |
+| `src/log_queue.h` | `IQueue` 与 `MutexRingQueue` |
+| `src/log_queue_lockfree.h` | `LockFreeRingQueue` |
+| `src/logger.h` | `Logger` 类、`QueueKind`、全局 C 风格接口 |
+| `src/logger.cpp` | 初始化/关闭、`vwrite`、后台线程、收尾 drain |
+| `src/log_writer.h` | `LogWriter` 与分类文件状态 |
+| `src/log_writer.cpp` | 创建目录、写密文、切分、flush、close |
+| `src/log_crypto.h/.cpp` | XOR 加解密、HEX 合法性校验 |
+| `src/metrics.h/.cpp` | 计数器、延迟直方图、P50/P90/P99 |
+| `src/benchmark.h` + `benchmark.cpp` | 压测配置、执行、结果输出 |
+| `test/test_business.cpp` | 业务模拟与 5 个测试用例 |
+| `main.cpp` | 程序入口和三种模式切换 |
 
-# 三、日志接口模块：`logger.h / logger.c`
+## 4. 关键设计点
 
-这个模块是业务代码真正调用的入口。
+### 4.1 入队前过滤与格式化
 
-需要实现这些对外函数：
+日志等级过滤和文本格式化都在入队前完成，减少队列热点路径停留时间。
 
-| 函数名                     | 功能                                        |
-| ----------------------- | ----------------------------------------- |
-| `log_init`              | 初始化日志系统，包括日志目录、最低日志等级、队列、锁、条件变量、后台写盘线程    |
-| `log_app`               | 写应用日志，类别固定为 `APP_LOG`                     |
-| `log_operation`         | 写操作日志，类别固定为 `OPERATION_LOG`               |
-| `log_error`             | 写错误日志，等级固定为 `LOG_ERROR`，类别通常为 `ERROR_LOG` |
-| `log_close`             | 关闭日志系统，通知后台线程退出，并等待剩余日志写完                 |
-| `log_get_dropped_count` | 返回因为队列满而被丢弃的日志数量                          |
+### 4.2 队列可替换
 
-这些函数在你们文档中已经作为核心接口列出。
+`Logger` 通过 `IQueue` 抽象切换 `Mutex` 与 `LockFree` 实现，便于压测对比。
 
-`logger.c` 内部还需要一个统一的内部函数：
+### 4.3 批量消费
 
-| 内部函数                 | 功能                                               |
-| -------------------- | ------------------------------------------------ |
-| `log_write_internal` | 统一处理 `log_app`、`log_operation`、`log_error` 的共同逻辑 |
+后台线程每次最多消费 `BATCH_SIZE` 条，降低频繁唤醒与 I/O 调度开销。
 
-`log_write_internal` 要完成这些事情：
+### 4.4 收尾机制
 
-```text
-1. 判断系统是否已经初始化
-2. 判断日志等级是否低于 min_level
-3. 如果低于等级，直接过滤
-4. 格式化日志内容
-5. 生成 LogRecord
-6. 加锁
-7. 判断队列是否满
-8. 队列满则 dropped_count++
-9. 队列未满则写入队列
-10. 通知后台写盘线程
-11. 解锁
+`Logger::close()` 会先停止新日志处理，再 drain 队列剩余数据，最后 flush/close 文件。
+
+### 4.5 加密边界
+
+加密在后台写盘阶段执行，业务线程不承担加密开销。
+
+## 5. 运行与输出路径
+
+### 5.1 编译与运行
+
+```bash
+make
+make run
+make test
+make bench
 ```
 
-注意：**格式化要在加锁前完成**，否则多个业务线程会长时间抢锁。
+### 5.2 可执行文件与中间产物
 
----
+- 可执行文件：`bin/logsys`
+- 对象文件：`build/`
 
-# 四、写盘模块：`log_writer.h / log_writer.c`
+### 5.3 运行时日志目录
 
-这个模块是后台消费者，负责真正写文件。
+- 运行模式：`runtime/logs/`
+- 压测模式：`runtime/bench_logs/`
+- 测试模式：`runtime/test_logs_basic/`、`runtime/test_logs_filter/`、`runtime/test_logs_rotate/`、`runtime/test_logs_decrypt/`
 
-需要实现这些函数：
+## 6. 测试与压测现状
 
-| 函数名                      | 功能                                |
-| ------------------------ | --------------------------------- |
-| `writer_init`            | 初始化写盘模块，创建日志目录，初始化三类日志文件状态，启动后台线程 |
-| `writer_thread_func`     | 后台写盘线程函数，等待通知、批量出队、分类、加密、写入文件     |
-| `writer_close`           | 设置停止标志，唤醒后台线程，等待线程退出              |
-| `writer_write_record`    | 写入单条日志，内部完成分类、加密、写盘、行数统计          |
-| `writer_open_file`       | 打开某一类日志对应的当前文件                    |
-| `writer_rotate_file`     | 当前文件达到最大行数后切分到下一个文件               |
-| `writer_flush_all`       | 刷新所有已打开的日志文件                      |
-| `writer_close_all_files` | 关闭所有日志文件                          |
+### 6.1 单元测试（`make test`）
 
-文档里明确后台线程负责等待条件变量、批量出队、分类、加密、写入 `.log.enc` 文件，并达到阈值后切分。
+- `test_basic_log`：基础写入与三分类文件落盘。
+- `test_level_filter`：等级过滤是否生效。
+- `test_file_rotate`：超过阈值后文件切分。
+- `test_queue_full`：队列满时丢弃行为。
+- `test_decrypt_one_line`：密文可正确解密。
 
-后台线程的逻辑应该是：
+### 6.2 压测（`make bench`）
 
-```text
-1. 等待队列非空
-2. 如果队列为空且 running=1，就继续等待
-3. 如果队列为空且 running=0，说明可以退出
-4. 如果队列非空，就批量取出日志
-5. 释放队列锁
-6. 对每条日志进行分类
-7. 加密
-8. 写入对应文件
-9. 检查是否需要切分文件
-10. 退出前刷新并关闭所有文件
-```
+- 对比维度：`mutex` vs `lockfree`。
+- 线程集合：`{1, 4, 8, 16}`。
+- 指标：吞吐、`p50/p90/p99`、`drop_rate`、`enqueued/dropped/written`。
 
-最关键的是：**后台线程取出日志后必须释放锁，再写文件**。你们文档图 1 的说明也强调，队列锁只保护入队和出队，不覆盖 `fprintf`、`fflush`、`fopen`、`fclose` 等慢速磁盘操作。
+## 7. 当前已知边界
 
----
+- 系统是进程内本地日志库，未实现网络传输与远程聚合。
+- 加密为 XOR，目标是演示加密链路，不提供高强度安全保证。
+- 后台消费线程单线程，极端写盘压力下可能成为瓶颈。
 
-# 五、加密模块：`log_crypto.h / log_crypto.c`
+## 8. 后续可演进方向
 
-这个模块负责 XOR 加密和解密验证。
-
-需要实现这些函数：
-
-| 函数名                    | 功能                       |
-| ---------------------- | ------------------------ |
-| `xor_encrypt_to_hex`   | 把明文日志先 XOR 加密，再转成十六进制字符串 |
-| `xor_decrypt_from_hex` | 把十六进制密文还原成明文，用于测试和验证     |
-| `hex_char_to_value`    | 内部辅助函数，把十六进制字符转成数值       |
-| `is_valid_hex_string`  | 检查密文是否是合法十六进制字符串         |
-
-加密模块不要在业务线程里调用，应该在后台写盘线程中调用。你们文档里的整体流程也是：后台线程批量出队后，按类别选择文件，然后 XOR 加密并转十六进制，最后写入 `.log.enc` 文件。
-
----
-
-# 六、测试业务模块：`test_business.h / test_business.c`
-
-这个模块模拟高并发业务线程。
-
-需要实现这些函数：
-
-| 函数名                     | 功能                       |
-| ----------------------- | ------------------------ |
-| `run_business_test`     | 创建多个业务线程，启动压测            |
-| `business_thread_func`  | 每个业务线程循环产生日志             |
-| `test_basic_log`        | 测试普通日志写入                 |
-| `test_level_filter`     | 测试日志等级过滤                 |
-| `test_file_rotate`      | 测试文件切分                   |
-| `test_queue_full`       | 测试队列满和丢弃计数               |
-| `test_decrypt_one_line` | 测试从 `.log.enc` 文件读取一行并解密 |
-
-你们文档里默认测试规模是 5 个业务线程，每个线程产生 1000 条日志，总共 5000 次日志调用。
-
----
-
-# 七、主程序模块：`main.c`
-
-`main.c` 不要写太多逻辑，只负责串流程。
-
-需要实现这些功能：
-
-| 函数/逻辑                      | 功能                      |
-| -------------------------- | ----------------------- |
-| 调用 `log_init`              | 初始化日志系统                 |
-| 调用 `run_business_test`     | 启动并发测试                  |
-| 调用 `log_get_dropped_count` | 输出丢弃日志数量                |
-| 调用 `log_close`             | 关闭系统，确保剩余日志写完           |
-| 可选调用解密测试                   | 验证 `.log.enc` 文件内容可以被还原 |
-
-主流程就是：
-
-```text
-初始化日志系统
-↓
-运行并发测试
-↓
-打印 dropped_count
-↓
-关闭日志系统
-↓
-检查日志文件
-```
-
----
-
-# 八、文件管理要实现的功能
-
-你们最终需要生成三类目录和文件：
-
-| 日志类别 | 目录                  | 文件名                       |
-| ---- | ------------------- | ------------------------- |
-| 应用日志 | `logs/application/` | `application_001.log.enc` |
-| 操作日志 | `logs/operation/`   | `operation_001.log.enc`   |
-| 错误日志 | `logs/error/`       | `error_001.log.enc`       |
-
-文档中也明确三类日志分别写入不同目录，并且每一类日志独立计数、独立切分、独立编号。
-
-所以文件管理部分要实现：
-
-```text
-1. 创建 logs 根目录
-2. 创建 application 子目录
-3. 创建 operation 子目录
-4. 创建 error 子目录
-5. 每类日志维护自己的 file_index
-6. 每类日志维护自己的 line_count
-7. 达到 MAX_LINES_PER_FILE 后切换到下一个文件
-```
-
----
-
-# 九、关闭流程要实现的功能
-
-`log_close` 不是简单退出，而是要保证日志尽量不丢。
-
-需要实现：
-
-```text
-1. 判断系统是否已经初始化
-2. 设置 running = 0
-3. 唤醒后台线程
-4. 后台线程继续处理队列中剩余日志
-5. 队列为空后后台线程退出
-6. 主线程等待后台线程结束
-7. 刷新文件
-8. 关闭文件
-9. 销毁锁和条件变量
-10. 标记系统未初始化
-```
-
-文档里也写明 `log_close` 要设置停止标志、唤醒后台线程、等待剩余日志写完，关闭文件并销毁同步对象。
-
----
-
-# 十、最终实现清单
-
-你们可以直接把下面这个作为小组开发任务表。
-
-| 模块              | 必须实现的函数                                                                                                                                                     |
-| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `log_queue`     | `queue_init`、`queue_empty`、`queue_full`、`queue_push`、`queue_pop_batch`                                                                                      |
-| `logger`        | `log_init`、`log_app`、`log_operation`、`log_error`、`log_close`、`log_get_dropped_count`、`log_write_internal`                                                   |
-| `log_writer`    | `writer_init`、`writer_thread_func`、`writer_close`、`writer_write_record`、`writer_open_file`、`writer_rotate_file`、`writer_flush_all`、`writer_close_all_files` |
-| `log_crypto`    | `xor_encrypt_to_hex`、`xor_decrypt_from_hex`、`hex_char_to_value`、`is_valid_hex_string`                                                                       |
-| `test_business` | `run_business_test`、`business_thread_func`、`test_basic_log`、`test_level_filter`、`test_file_rotate`、`test_queue_full`、`test_decrypt_one_line`                |
-| `main`          | 初始化、运行测试、打印统计、关闭系统                                                                                                                                          |
-
-你们实现时就按这个顺序来：
-
-```text
-1. 先实现 log_common 和 log_queue
-2. 再实现 logger 的初始化和写日志接口
-3. 再实现后台 writer 线程
-4. 再实现分类存储和文件切分
-5. 再加入 XOR 加密和解密
-6. 最后写 test_business 做并发压测
-```
-
-这样分工最清楚，也最适合答辩讲解。
-
----
-
-# 扩展方向：多队列实现对比与性能压测（进阶）
-
-这一部分是在基础日志库之上的**进阶工程**，目标是让项目具备可量化的性能评估能力，也是答辩最能体现技术深度的部分。
-
-核心思路：**实现两套队列（加锁循环队列 vs 无锁 MPSC 循环队列），把它们放到同一套压测框架下运行，采集吞吐量、延迟分位、丢弃率等指标，最后产出对比报告。**
-
-关键背景：本系统是「多个业务线程写入、单个后台线程消费」的模型，即 **MPSC（多生产者单消费者）**。这个模型可以做出真正的无锁队列，难度可控，非常适合作为对比对象。
-
----
-
-## 十一、无锁队列模块：`log_queue_lockfree.h / log_queue_lockfree.c`
-
-用 C11 原子操作（`<stdatomic.h>`）实现一个有界的 MPSC 无锁循环队列，作为加锁队列的对照组。
-
-需要实现这些函数：
-
-| 函数名                  | 功能                                                     |
-| -------------------- | ------------------------------------------------------ |
-| `lfqueue_init`       | 初始化无锁队列，原子变量 `head`、`tail` 清零                          |
-| `lfqueue_push`       | 多生产者入队：用 `atomic_fetch_add` 抢占槽位，写入后用 release 标记可见     |
-| `lfqueue_pop_batch`  | 单消费者批量出队：读取已提交的槽位，最多取 `BATCH_SIZE` 条                   |
-| `lfqueue_approx_size`| 近似长度（用于监控，允许不精确）                                       |
-
-实现要点（答辩讲解重点）：
-
-```text
-1. 多生产者用 atomic_fetch_add 原子递增 tail 抢占写入槽位，天然无锁
-2. 槽位内用「就绪标志」(ready flag) 标记该条日志是否写完，防止消费者读到半成品
-3. 内存序：生产者写数据用 memory_order_release，消费者读用 memory_order_acquire
-4. 队列满时（tail - head >= 容量）回退并计入 dropped_count
-5. 单消费者出队不需要 CAS，只需按序读取 ready 的槽位
-```
-
-需要在文档里明确说明：无锁不等于「没有代价」，它把锁竞争换成了原子指令和缓存一致性开销，对比测试就是要量化这个权衡。
-
----
-
-## 十二、队列抽象接口：`log_queue_iface.h`
-
-为了让 `logger.c` 能在两套队列之间切换而不改业务代码，需要一层抽象。
-
-两种实现方式二选一（文档里说明选型理由）：
-
-| 方式         | 做法                                                       |
-| ---------- | -------------------------------------------------------- |
-| 编译期开关      | 用 `#ifdef USE_LOCKFREE` 决定编译哪套队列，零运行时开销，最简单             |
-| 运行期函数指针    | 定义 `QueueOps` 结构体（含 push/pop/init 函数指针），启动时按配置选择实现       |
-
-建议大一阶段先用**编译期开关**，简单可靠；行有余力再做函数指针版本。
-
----
-
-## 十三、指标采集模块：`metrics.h / metrics.c`
-
-负责在压测过程中收集性能数据。
-
-需要实现这些函数：
-
-| 函数名                     | 功能                                             |
-| ----------------------- | ---------------------------------------------- |
-| `metrics_init`          | 初始化计数器和延迟直方图                                   |
-| `metrics_record_latency`| 记录一次入队操作的耗时（纳秒），落到直方图桶里                        |
-| `metrics_inc_enqueued`  | 原子累加成功入队数                                      |
-| `metrics_inc_dropped`   | 原子累加丢弃数                                        |
-| `metrics_inc_written`   | 后台线程累加已落盘条数                                    |
-| `metrics_compute`       | 汇总计算 P50 / P90 / P99 延迟、平均延迟、丢弃率               |
-| `metrics_report`        | 打印/导出统计结果（控制台 + CSV）                          |
-
-实现要点：
-
-```text
-1. 计数器全部用 atomic_uint_fast64_t，避免多线程累加出错
-2. 延迟用「直方图分桶」而不是存每一条，省内存也够精确
-3. 分位数 P99 = 从小到大累计到 99% 时所在的桶
-4. 用 clock_gettime(CLOCK_MONOTONIC) 取纳秒时间戳测单次延迟
-```
-
----
-
-## 十四、压测框架模块：`benchmark.h / benchmark.c`
-
-统一驱动两套队列跑相同负载。
-
-需要实现这些函数：
-
-| 函数名                   | 功能                                                  |
-| --------------------- | --------------------------------------------------- |
-| `bench_config_default`| 返回默认压测参数（线程数、每线程条数、预热轮数等）                          |
-| `bench_run`           | 按配置启动业务线程压测，计时并采集指标                                |
-| `bench_worker`        | 单个压测线程：循环调用日志接口，记录每次入队延迟                          |
-| `bench_warmup`        | 预热阶段，避免冷启动干扰测量结果                                    |
-| `bench_summary`       | 打印本轮吞吐量、延迟分位、丢弃率                                    |
-| `bench_compare`       | 依次跑加锁队列和无锁队列，输出并排对比表                               |
-
-压测流程：
-
-```text
-1. 读取压测配置（线程数 N、每线程条数 M）
-2. 预热：先空跑一小批，稳定缓存和分支预测
-3. 正式测：记录开始时间戳
-4. 启动 N 个业务线程，每个产生 M 条日志，记录每次入队延迟
-5. 等所有业务线程结束，记录结束时间戳
-6. 吞吐量 = 总条数 / 总耗时（条/秒）
-7. 从 metrics 取 P50/P90/P99 延迟和丢弃率
-8. 两套队列各跑一遍，bench_compare 汇总成对比表
-```
-
-对比实验建议做成一张表，横向对比不同并发度（如 1 / 4 / 8 / 16 线程）下的表现：
-
-| 队列实现  | 线程数 | 吞吐量(条/秒) | P50延迟 | P99延迟 | 丢弃率 |
-| ------ | ---- | -------- | ----- | ----- | --- |
-| 加锁队列  | 8    | …        | …     | …     | …   |
-| 无锁队列  | 8    | …        | …     | …     | …   |
-
-这张表就是答辩时最有说服力的结论。
-
----
-
-## 十五、扩展部分的实现清单与顺序
-
-| 模块                  | 必须实现的函数                                                                             |
-| ------------------- | ----------------------------------------------------------------------------------- |
-| `log_queue_lockfree`| `lfqueue_init`、`lfqueue_push`、`lfqueue_pop_batch`、`lfqueue_approx_size`             |
-| `log_queue_iface`   | 编译期开关 `USE_LOCKFREE` 或运行期 `QueueOps` 函数指针表                                          |
-| `metrics`           | `metrics_init`、`metrics_record_latency`、`metrics_inc_*`、`metrics_compute`、`metrics_report` |
-| `benchmark`         | `bench_config_default`、`bench_run`、`bench_worker`、`bench_warmup`、`bench_summary`、`bench_compare` |
-
-推荐实现顺序（在基础日志库跑通之后再做）：
-
-```text
-1. 先做 metrics 指标采集（先能测出加锁队列的吞吐和延迟）
-2. 再做 benchmark 压测框架，把加锁队列的数据先跑出来
-3. 然后实现 log_queue_lockfree 无锁队列
-4. 用 log_queue_iface 让 logger 能切换两套队列
-5. 最后 bench_compare 跑对比实验，产出报告表和结论
-```
-
-## 十六、扩展部分交付物
-
-除了基础日志库，进阶部分额外交付：
-
-```text
-1. 无锁 MPSC 队列源码 + 内存序设计说明
-2. 压测框架和指标采集模块源码
-3. 性能对比报告（含吞吐/延迟/丢弃率对比表和折线图）
-4. 结论分析：什么并发度下无锁更优、代价在哪、如何权衡
-```
-
-这一整块做下来，项目就从「实现一个日志库」升级为「实现并定量评估一个高并发日志库」，工作量和技术深度都足够撑起一次完整答辩。
+- 提供可配置的刷盘策略（时间窗口/批次阈值）。
+- 增加结构化日志字段（JSON 或 key-value）。
+- 增加更强加密方案与密钥管理。
+- 引入多消费者写盘或分区写盘策略。

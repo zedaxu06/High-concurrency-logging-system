@@ -1,98 +1,87 @@
-# 高并发异步日志系统（C++ 实现）
+# 高并发异步日志系统（C++17）
 
-一个本地 C++ 异步日志库：业务线程写日志请求 → 进入异步队列 → 后台线程批量出队、分类、XOR 加密、写入 `.log.enc` 文件，并支持关闭收尾与丢弃统计。
+这是一个本地高并发异步日志系统：业务线程负责格式化并入队，后台线程批量出队后按类别写文件，写入前做 XOR 加密并保存为 `.log.enc`。
 
-在基础功能之上，额外实现了 **加锁队列 vs 无锁队列** 两套实现，配套压测框架量化两者在不同并发度下的吞吐量与延迟差异。
+项目支持两种队列实现（`MutexRingQueue` / `LockFreeRingQueue`），并提供统一压测框架比较吞吐、延迟分位和丢弃率。
 
-## 项目功能
+## 核心能力
 
-- 多业务线程模拟真实业务场景，产生日志请求。
-- 后台线程批量消费日志，按类别写入不同文件。
-- 日志写入前完成等级过滤和格式化，降低锁竞争。
-- 支持日志文件按行数切分，自动生成 `.log.enc` 文件。
-- 支持关闭收尾，尽量把队列中的剩余日志写完。
-- 支持压测对比加锁队列和无锁队列。
+- 多线程并发写日志，单后台线程异步落盘。
+- 按类别分目录：`application` / `operation` / `error`。
+- 日志文件按行数切分（`MAX_LINES_PER_FILE`）。
+- 入队失败统计丢弃数，支持关闭收尾（drain 队列）。
+- 支持 `run` / `test` / `bench` 三种运行模式。
 
-## 目录结构
+## 当前架构
 
-| 文件 | 说明 |
+### 线程模型
+
+- 生产者：多个业务线程调用 `log_app` / `log_operation` / `log_error`。
+- 消费者：`Logger::thread_func` 单线程批量消费并写盘。
+- 队列模型：项目实际使用场景为 MPSC；无锁实现采用 Vyukov bounded MPMC 算法。
+
+### 数据流
+
+1. 业务线程调用日志接口。
+2. `Logger::vwrite` 做等级过滤与格式化。
+3. 尝试 `queue_->try_push`，成功则唤醒后台线程，失败则计入 dropped。
+4. 后台线程 `pop_batch` 取数据并写入 `LogWriter`。
+5. `LogWriter` 对文本执行 `xor_encrypt_to_hex` 后写入 `.log.enc`。
+6. 达到行数阈值时自动 rotate 文件。
+
+## 模块说明
+
+| 路径 | 作用 |
 | --- | --- |
-| `log_common.h` | 公共类型与常量 |
-| `log_queue.h` | 加锁队列抽象与实现 |
-| `log_queue_lockfree.h` | 无锁队列实现 |
-| `log_crypto.h/.cpp` | XOR 加密与解密 |
-| `metrics.h/.cpp` | 统计指标 |
-| `log_writer.h/.cpp` | 后台写盘与文件切分 |
-| `logger.h/.cpp` | 日志系统核心接口 |
-| `test_business.h/.cpp` | 伪业务线程与单元测试 |
-| `benchmark.h/.cpp` | 压测对比 |
-| `main.cpp` | 程序入口 |
-| `Makefile` | 编译与运行命令 |
+| `src/log_common.h` | 公共类型与常量（等级、类别、队列容量、切分阈值等） |
+| `src/log_queue.h` | 队列抽象 `IQueue` 与加锁实现 `MutexRingQueue` |
+| `src/log_queue_lockfree.h` | 无锁实现 `LockFreeRingQueue` |
+| `src/logger.h` / `src/logger.cpp` | 日志核心、后台线程、全局接口封装 |
+| `src/log_writer.h` / `src/log_writer.cpp` | 分类写盘、切分、flush/close |
+| `src/log_crypto.h` / `src/log_crypto.cpp` | XOR + 十六进制编解码 |
+| `src/metrics.h` / `src/metrics.cpp` | 指标采集（enqueued/dropped/written、P50/P90/P99） |
+| `src/benchmark.h` + `benchmark.cpp` | 压测配置与对比执行 |
+| `test/test_business.cpp` | 业务模拟与 5 个测试用例 |
+| `main.cpp` | 程序入口（run/test/bench） |
 
-## 日志输出位置
+## 目录与产物
 
-默认日志输出到 `logs/` 目录下：
+### 编译产物
 
-- `logs/application/application_001.log.enc`
-- `logs/operation/operation_001.log.enc`
-- `logs/error/error_001.log.enc`
+- 可执行文件：`bin/logsys`
+- 中间文件：`build/`
 
-压测输出默认写到 `bench_logs/`，单元测试输出写到 `test_logs_*` 目录。
+### 运行期输出
+
+- 默认运行日志：`runtime/logs/`
+- 压测日志：`runtime/bench_logs/`
+- 测试日志：`runtime/test_logs_basic/`、`runtime/test_logs_filter/`、`runtime/test_logs_rotate/`、`runtime/test_logs_decrypt/`
+
+示例文件：
+
+- `runtime/logs/application/application_001.log.enc`
+- `runtime/logs/operation/operation_001.log.enc`
+- `runtime/logs/error/error_001.log.enc`
 
 ## 快速开始
 
 ```bash
-make            # 编译，产物为 ./logsys
-make run        # 基础功能演示（5 线程 × 1000 条）+ 单元测试
-make test       # 只跑单元测试
-make bench      # 加锁队列 vs 无锁队列 压测对比
-make clean      # 清理
+make           # 编译
+make run       # 默认演示：业务并发写日志 + 解密预览 + 单测
+make test      # 仅执行单测
+make bench     # 队列对比压测
+make clean     # 清理 build/bin
 ```
 
-## 编译命令
+## 运行模式
 
-```bash
-make
-```
+- `run`：初始化 `runtime/logs`，运行 5 线程 × 1000 条日志，打印丢弃计数，关闭后做解密预览并执行单测。
+- `test`：运行 `test_basic_log`、`test_level_filter`、`test_file_rotate`、`test_queue_full`、`test_decrypt_one_line`。
+- `bench`：在线程数 `{1, 4, 8, 16}` 下分别比较 `mutex` 与 `lockfree`。
 
-## 运行命令
+## 设计说明
 
-```bash
-make run
-```
-
-## 测试方法
-
-```bash
-make test
-```
-
-测试会自动检查：基础写日志、等级过滤、文件切分、队列满丢弃、密文解密。
-
-## 模块结构
-
-| 文件 | 职责 |
-| --- | --- |
-| `log_common.h` | 公共类型（`LogLevel` / `LogCategory` / `LogRecord`）与常量 |
-| `log_queue.h` | 队列抽象接口 `IQueue` + 加锁循环队列 `MutexRingQueue` |
-| `log_queue_lockfree.h` | 有界无锁队列 `LockFreeRingQueue`（Vyukov bounded MPMC 算法） |
-| `log_crypto.{h,cpp}` | XOR 加密 / 十六进制编解码 |
-| `metrics.{h,cpp}` | 原子计数器 + 延迟直方图，计算 P50/P90/P99 |
-| `log_writer.{h,cpp}` | 后台写盘：按类别分文件、加密、按行数切分 |
-| `logger.{h,cpp}` | 日志系统核心 + 与预案一致的全局接口 |
-| `test_business.{h,cpp}` | 高并发压测线程 + 5 个单元测试 |
-| `benchmark.{h,cpp}` | 压测框架，驱动两套队列跑相同负载并对比 |
-| `main.cpp` | 入口：`run` / `test` / `bench` 三种模式 |
-
-## 设计要点
-
-- **模型**：多业务线程生产、单后台线程消费，即 **MPSC（多生产者单消费者）**。
-- **锁的边界**：`MutexRingQueue` 内部用互斥量保证线程安全；后台线程 **取出日志后立即让出队列**，`fopen/fwrite/fflush` 等慢速磁盘操作不持有队列锁。
-- **无锁对照**：`LockFreeRingQueue` 用每槽序号 + CAS 实现有界无锁入队/出队，容量取 2 的幂用位与取模。
-- **等级过滤与格式化在入队前完成**，避免多线程长时间抢占队列。
-- **关闭收尾**：`log_close` 设置停止标志、唤醒后台线程、把队列剩余日志写完，再关闭文件。
-- **加密**：仅在后台线程调用，写入 `.log.enc`；`xor_decrypt_from_hex` 可还原验证。
-
-## 压测结论（示例，机器不同数值会变）
-
-无锁队列在各并发度下 **入队延迟与尾延迟（P99）明显更低、吞吐更高**；但由于瓶颈在单消费者磁盘写入，生产者更快反而会更快填满队列，**丢弃率略高**——这正说明高并发日志系统的真正瓶颈往往在消费端 I/O，而非入队路径。
+- 过滤与格式化在入队前完成，减少队列临界区开销。
+- 后台线程批量消费，降低唤醒与 I/O 调度开销。
+- `close()` 会先停接收，再清空队列并 flush，尽量避免退出丢日志。
+- 统计指标面向“入队路径性能”与“系统丢弃行为”，便于压测分析瓶颈。
