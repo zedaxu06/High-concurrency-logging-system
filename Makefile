@@ -1,5 +1,5 @@
 CXX      ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -pthread
+CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -pthread -finput-charset=utf-8 -fexec-charset=utf-8
 LDFLAGS  ?= -pthread
 
 SRCS = log_crypto.cpp metrics.cpp log_writer.cpp logger.cpp \
