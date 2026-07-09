@@ -4,6 +4,41 @@
 
 在基础功能之上，额外实现了 **加锁队列 vs 无锁队列** 两套实现，配套压测框架量化两者在不同并发度下的吞吐量与延迟差异。
 
+## 项目功能
+
+- 多业务线程模拟真实业务场景，产生日志请求。
+- 后台线程批量消费日志，按类别写入不同文件。
+- 日志写入前完成等级过滤和格式化，降低锁竞争。
+- 支持日志文件按行数切分，自动生成 `.log.enc` 文件。
+- 支持关闭收尾，尽量把队列中的剩余日志写完。
+- 支持压测对比加锁队列和无锁队列。
+
+## 目录结构
+
+| 文件 | 说明 |
+| --- | --- |
+| `log_common.h` | 公共类型与常量 |
+| `log_queue.h` | 加锁队列抽象与实现 |
+| `log_queue_lockfree.h` | 无锁队列实现 |
+| `log_crypto.h/.cpp` | XOR 加密与解密 |
+| `metrics.h/.cpp` | 统计指标 |
+| `log_writer.h/.cpp` | 后台写盘与文件切分 |
+| `logger.h/.cpp` | 日志系统核心接口 |
+| `test_business.h/.cpp` | 伪业务线程与单元测试 |
+| `benchmark.h/.cpp` | 压测对比 |
+| `main.cpp` | 程序入口 |
+| `Makefile` | 编译与运行命令 |
+
+## 日志输出位置
+
+默认日志输出到 `logs/` 目录下：
+
+- `logs/application/application_001.log.enc`
+- `logs/operation/operation_001.log.enc`
+- `logs/error/error_001.log.enc`
+
+压测输出默认写到 `bench_logs/`，单元测试输出写到 `test_logs_*` 目录。
+
 ## 快速开始
 
 ```bash
@@ -13,6 +48,26 @@ make test       # 只跑单元测试
 make bench      # 加锁队列 vs 无锁队列 压测对比
 make clean      # 清理
 ```
+
+## 编译命令
+
+```bash
+make
+```
+
+## 运行命令
+
+```bash
+make run
+```
+
+## 测试方法
+
+```bash
+make test
+```
+
+测试会自动检查：基础写日志、等级过滤、文件切分、队列满丢弃、密文解密。
 
 ## 模块结构
 

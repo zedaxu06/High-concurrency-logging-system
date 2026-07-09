@@ -44,8 +44,13 @@ void Logger::vwrite(LogLevel level, LogCategory cat, const char* fmt, va_list ap
 
     // 格式化在加锁/入队之前完成，避免多线程长时间抢占队列
     std::time_t now = std::time(nullptr);
-    std::tm     tmv;
+    std::tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &now);
+#else
     localtime_r(&now, &tmv);
+#endif
+
     char ts[24];
     std::strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tmv);
 

@@ -13,13 +13,43 @@
 
 namespace fs = std::filesystem;
 
-// 每个业务线程循环产生三类日志
-static void business_thread_func(int id, int count) {
+// 伪业务函数：模拟不同业务场景产生日志
+void simulate_login(int id, int count) {
     for (int i = 0; i < count; ++i) {
-        int r = i % 3;
-        if (r == 0)      log_app(LogLevel::INFO, "thread %d app message #%d", id, i);
-        else if (r == 1) log_operation(LogLevel::INFO, "thread %d op message #%d", id, i);
-        else             log_error("thread %d error message #%d", id, i);
+        log_app(LogLevel::INFO, "thread %d login user #%d", id, i);
+        log_operation(LogLevel::INFO, "thread %d login audit #%d", id, i);
+    }
+}
+
+void simulate_order(int id, int count) {
+    for (int i = 0; i < count; ++i) {
+        log_app(LogLevel::INFO, "thread %d order created #%d", id, i);
+        log_operation(LogLevel::INFO, "thread %d order updated #%d", id, i);
+    }
+}
+
+void simulate_file_task(int id, int count) {
+    for (int i = 0; i < count; ++i) {
+        log_app(LogLevel::INFO, "thread %d file upload start #%d", id, i);
+        log_operation(LogLevel::INFO, "thread %d file upload finish #%d", id, i);
+    }
+}
+
+void simulate_error(int id, int count) {
+    for (int i = 0; i < count; ++i) {
+        log_app(LogLevel::WARN, "thread %d warning before error #%d", id, i);
+        log_operation(LogLevel::INFO, "thread %d error handling #%d", id, i);
+        log_error("thread %d simulated error #%d", id, i);
+    }
+}
+
+// 每个业务线程循环产生不同业务场景日志
+static void business_thread_func(int id, int count) {
+    switch (id % 4) {
+        case 0: simulate_login(id, count); break;
+        case 1: simulate_order(id, count); break;
+        case 2: simulate_file_task(id, count); break;
+        default: simulate_error(id, count); break;
     }
 }
 
