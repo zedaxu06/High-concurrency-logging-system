@@ -3,9 +3,22 @@
 #include "benchmark.h"
 #include "log_crypto.h"
 
+#include <clocale>
 #include <cstdio>
 #include <fstream>
 #include <string>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+static void init_console_utf8() {
+#ifdef _WIN32
+    SetConsoleOutputCP(CP_UTF8);
+    SetConsoleCP(CP_UTF8);
+#endif
+    std::setlocale(LC_ALL, ".UTF8");
+}
 
 // 从应用日志读取一行密文并解密，验证 .log.enc 内容可还原
 static void demo_decrypt_preview() {
@@ -19,6 +32,8 @@ static void demo_decrypt_preview() {
 }
 
 int main(int argc, char** argv) {
+    init_console_utf8();
+
     std::string mode = (argc > 1) ? argv[1] : "run";
 
     if (mode == "bench") {
